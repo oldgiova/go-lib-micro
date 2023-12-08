@@ -17,7 +17,10 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"text/template"
 	"time"
@@ -42,6 +45,63 @@ const (
 type AccessLogMiddleware struct {
 	Format       AccessLogFormat
 	textTemplate *template.Template
+
+	recorder *rest.RecorderMiddleware
+}
+
+func (mw *AccessLogMiddleware) LogFunc(startTime time.Time, w rest.ResponseWriter, r *rest.Request) {
+	util := &accessLogUtil{w, r}
+	fields := logrus.Fields{
+		"type":   r.Proto,
+		"ts":     startTime,
+		"method": r.Method,
+		"path":   r.URL.Path,
+		"qs":     r.URL.RawQuery,
+	}
+
+	if panic := recover(); panic != nil {
+		var (
+			trace     [MaxTraceback]uintptr
+			traceback strings.Builder
+		)
+		n := runtime.Callers(3, trace[:])
+		frames := runtime.CallersFrames(trace[:n])
+		for frame, _ := frames.Next(); frame.PC != 0 && n >= 0; frame, _ = frames.Next() {
+			funcName := frame.Function
+			if funcName == "" {
+				fmt.Fprint(&traceback, "???\n")
+			} else {
+				fmt.Fprintf(&traceback, "%s(%s):%d\n",
+					filepath.Base(frame.File), frame.Function, frame.Line,
+				)
+			}
+			n--
+		}
+		rest.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		fields["panic"] = panic
+		fields["trace"] = traceback.String()
+	}
+	rspTime := time.Since(startTime)
+	// We do not need more than 3 digit fraction
+	if rspTime > time.Second {
+		rspTime = rspTime.Round(time.Millisecond)
+	} else if rspTime > time.Millisecond {
+		rspTime = rspTime.Round(time.Microsecond)
+	}
+	fields["responsetime"] = rspTime.String()
+	fields["byteswritten"] = util.BytesWritten()
+	statusCode := util.StatusCode()
+	fields["status"] = statusCode
+
+	logger := requestlog.GetRequestLogger(r)
+	var level logrus.Level = logrus.InfoLevel
+	if statusCode >= 500 {
+		level = logrus.ErrorLevel
+	} else if statusCode >= 300 {
+		level = logrus.WarnLevel
+	}
+	logger.WithFields(fields).
+		Log(level, mw.executeTextTemplate(util))
 }
 
 // MiddlewareFunc makes AccessLogMiddleware implement the Middleware interface.
@@ -52,36 +112,14 @@ func (mw *AccessLogMiddleware) MiddlewareFunc(h rest.HandlerFunc) rest.HandlerFu
 
 	mw.convertFormat()
 
-	return func(w rest.ResponseWriter, r *rest.Request) {
-
+	// This middleware depends on RecorderMiddleware to work
+	mw.recorder = new(rest.RecorderMiddleware)
+	return mw.recorder.MiddlewareFunc(func(w rest.ResponseWriter, r *rest.Request) {
+		startTime := time.Now()
+		defer mw.LogFunc(startTime, w, r)
 		// call the handler
 		h(w, r)
-
-		util := &accessLogUtil{w, r}
-		logger := requestlog.GetRequestLogger(r)
-		logged := false
-		log := logger.WithFields(logrus.Fields{
-			"type":         TypeHTTP,
-			"ts":           util.StartTime().Round(0),
-			"status":       util.StatusCode(),
-			"responsetime": util.ResponseTime().Seconds(),
-			"byteswritten": util.BytesWritten(),
-			"method":       r.Method,
-			"path":         r.URL.Path,
-			"qs":           r.URL.RawQuery,
-		})
-		for pathSuffix, status := range DebugLogsByPathSuffix {
-			if util.StatusCode() == status && strings.HasSuffix(r.URL.Path, pathSuffix) {
-				log.Debug(mw.executeTextTemplate(util))
-				logged = true
-				break
-			}
-		}
-
-		if !logged {
-			log.Print(mw.executeTextTemplate(util))
-		}
-	}
+	})
 }
 
 var apacheAdapter = strings.NewReplacer(
